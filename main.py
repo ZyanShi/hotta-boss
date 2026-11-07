@@ -3,6 +3,10 @@ import os
 import ctypes
 import threading
 import time
+import json
+import tempfile
+import subprocess
+import urllib.request
 import tkinter as tk
 from tkinter import ttk
 import tkinter.font as tkfont
@@ -23,7 +27,7 @@ try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)   # PER_MONITOR_DPI_AWARE
 except Exception:
     try:
-        ctypes.windll.user32.SetProcessDPIAware()    # 旧系统兜底
+        ctypes.windll.user32.SetProcessDPIAware()
     except Exception:
         pass
 
@@ -34,17 +38,34 @@ except Exception:
     pass
 
 # ============================================================
-# 逻辑分辨率（所有硬编码坐标以此为准）
-# 支持任意分辨率的窗口，前提宽高比保持 16:9
-#   1080p → scale=1.0   720p → scale=0.6667   1440p → scale=1.3333
+# 逻辑分辨率（所有硬编码坐标以此为准，支持任意 16:9 分辨率）
 # ============================================================
 LOGICAL_WIDTH = 1920
 LOGICAL_HEIGHT = 1080
 
 FORCE_ADMIN = True
 
-APP_VERSION = "2.3.0"       # ← 新增：当前版本号，发新版时改这里
+# ========== 自动更新配置 ==========
+APP_VERSION = "2.2.3"   # 每次发版前改这里，重新打包
 VERSION_URL = "https://raw.githubusercontent.com/ZyanShi/hotta-boss/refs/heads/main/version.json"
+
+
+# ========== 日志（--noconsole 下写入 exe 同目录 update.log 便于排查） ==========
+def log(msg):
+    try:
+        print(msg)
+    except Exception:
+        pass
+    try:
+        if getattr(sys, "frozen", False):
+            base = os.path.dirname(sys.executable)
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(base, "update.log")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
 
 
 # ========== 资源路径兼容 ==========
@@ -116,6 +137,76 @@ def lower_own_priority():
 
 
 # ============================================================
+# 自动更新
+# ============================================================
+def check_and_download(on_done):
+    """后台检查 version.json 并下载新 exe，完成后回调 on_done(新 exe 路径或 None)。"""
+    def worker():
+        new_exe = None
+        try:
+            log(f"[更新] 检查更新: {VERSION_URL}")
+            req = urllib.request.Request(
+                VERSION_URL,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                raw = r.read().decode("utf-8")
+            meta = json.loads(raw)
+            remote_ver = str(meta.get("version", "")).strip()
+            dl_url = str(meta.get("url", "")).strip()
+            log(f"[更新] 本地={APP_VERSION} 远程={remote_ver} url={dl_url}")
+            if not dl_url:
+                log("[更新] version.json 里 url 为空，跳过下载")
+            elif remote_ver and remote_ver != APP_VERSION:
+                tmp = os.path.join(tempfile.gettempdir(),
+                                   f"app_update_{remote_ver}.exe")
+                log(f"[更新] 开始下载到 {tmp}")
+                urllib.request.urlretrieve(dl_url, tmp)
+                if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+                    new_exe = tmp
+                    log(f"[更新] 下载完成，大小={os.path.getsize(tmp)} 字节")
+                else:
+                    log("[更新] 下载文件异常（不存在或为 0 字节）")
+        except Exception as e:
+            log(f"[更新] 检查失败（不影响使用）: {e}")
+        on_done(new_exe)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def apply_update_and_restart(new_exe_path):
+    """写 bat → 后台替换 exe → 重启 → 当前进程退出。"""
+    current_exe = os.path.abspath(
+        sys.executable if getattr(sys, "frozen", False) else sys.argv[0]
+    )
+    new_exe_path = os.path.abspath(new_exe_path)
+    bat_path = os.path.join(tempfile.gettempdir(), "app_update_run.bat")
+
+    bat = (
+        "@echo off\r\n"
+        "timeout /t 4 /nobreak >nul\r\n"
+        f'copy /y "{new_exe_path}" "{current_exe}"\r\n'
+        "timeout /t 2 /nobreak >nul\r\n"
+        f'start "" "{current_exe}"\r\n'
+        'del "%~f0"\r\n'
+    )
+    try:
+        with open(bat_path, "w", encoding="gbk") as f:
+            f.write(bat)
+        log(f"[更新] 已写更新脚本: {bat_path}")
+        log(f"[更新] 目标文件: {current_exe}")
+        subprocess.Popen(
+            ["cmd", "/c", bat_path],
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+            close_fds=True,
+        )
+    except Exception as e:
+        log(f"[更新] 启动更新脚本失败: {e}")
+        return
+    os._exit(0)
+
+
+# ============================================================
 # 游戏窗口绑定 + 逻辑坐标换算
 # ============================================================
 class GameWindow:
@@ -151,7 +242,6 @@ class GameWindow:
         return ok
 
     def refresh(self):
-        """刷新窗口客户区位置/尺寸（窗口可能被移动/缩放）。"""
         if not self.hwnd:
             return False
         try:
@@ -198,7 +288,7 @@ class GameWindow:
 game_window = GameWindow()
 
 
-# ========== 逻辑坐标辅助函数 ==========
+# ========== 逻辑坐标辅助 ==========
 def click_logical(x, y):
     sx, sy = game_window.to_screen(x, y)
     pyautogui.click(sx, sy)
@@ -1248,9 +1338,32 @@ class AutomationApp:
 
         self._build_ui()
 
+        # ===== 启动后台检查更新（1.5 秒后，避免阻塞 UI 出现） =====
+        self.root.after(1500, lambda: check_and_download(self._on_update_ready))
+
         keyboard.add_hotkey('f10', lambda: self.root.after(0, self.start))
         keyboard.add_hotkey('f12', lambda: self.root.after(0, self.stop))
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _on_update_ready(self, new_exe):
+        if not new_exe:
+            return
+        try:
+            from tkinter import messagebox
+            if self.is_running:
+                messagebox.showinfo("发现新版本",
+                                    "检测到新版本，但当前正在运行任务。\n"
+                                    "请先点击「停止」，再重启程序完成更新。")
+                return
+            if messagebox.askyesno(
+                "发现新版本",
+                f"检测到新版本（当前 {APP_VERSION}）。\n"
+                "是否立即更新并重启？\n\n"
+                "（程序会关闭并自动替换为新版本后重新启动）"
+            ):
+                apply_update_and_restart(new_exe)
+        except Exception as e:
+            log(f"[更新] 提示失败: {e}")
 
     @staticmethod
     def _pick_font():
@@ -1307,7 +1420,8 @@ class AutomationApp:
 
         tk.Label(container, text="幻塔BOSS", bg=C_BG, fg=C_TEXT,
                  font=(self.F, 20, "bold"), anchor="w").pack(fill=tk.X)
-        tk.Label(container, text="F10 启动   ·   F12 停止", bg=C_BG, fg=C_TEXT2,
+        tk.Label(container, text=f"F10 启动   ·   F12 停止   ·   v{APP_VERSION}",
+                 bg=C_BG, fg=C_TEXT2,
                  font=(self.F, 10), anchor="w").pack(fill=tk.X, pady=(2, 0))
 
         card = Card(container, width=352, height=248, radius=16, bg=C_BG)
