@@ -46,7 +46,7 @@ LOGICAL_HEIGHT = 1080
 FORCE_ADMIN = True
 
 # ========== 自动更新配置 ==========
-APP_VERSION = "2.2.3"   # 每次发版前改这里，重新打包
+APP_VERSION = "2.3.0"   # 每次发版前改这里，重新打包
 VERSION_URL = "https://raw.githubusercontent.com/ZyanShi/hotta-boss/refs/heads/main/version.json"
 
 
