@@ -3,10 +3,6 @@ import os
 import ctypes
 import threading
 import time
-import json
-import tempfile
-import subprocess
-import urllib.request
 import tkinter as tk
 from tkinter import ttk
 import tkinter.font as tkfont
@@ -22,15 +18,6 @@ import cv2
 import numpy as np
 from PIL import ImageGrab
 
-# ========== DPI 感知（必须在创建 Tk 窗口前执行） ==========
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)   # PER_MONITOR_DPI_AWARE
-except Exception:
-    try:
-        ctypes.windll.user32.SetProcessDPIAware()
-    except Exception:
-        pass
-
 try:
     cv2.setNumThreads(1)
     cv2.setUseOptimized(True)
@@ -38,34 +25,14 @@ except Exception:
     pass
 
 # ============================================================
-# 逻辑分辨率（所有硬编码坐标以此为准，支持任意 16:9 分辨率）
+# 逻辑分辨率（所有硬编码坐标以此为准）
+# 支持任意分辨率的窗口，前提宽高比保持 16:9
+#   1080p → scale=1.0   720p → scale=0.6667   1440p → scale=1.3333
 # ============================================================
 LOGICAL_WIDTH = 1920
 LOGICAL_HEIGHT = 1080
 
 FORCE_ADMIN = True
-
-# ========== 自动更新配置 ==========
-APP_VERSION = "2.3.0"   # 每次发版前改这里，重新打包
-VERSION_URL = "https://raw.githubusercontent.com/ZyanShi/hotta-boss/refs/heads/main/version.json"
-
-
-# ========== 日志（--noconsole 下写入 exe 同目录 update.log 便于排查） ==========
-def log(msg):
-    try:
-        print(msg)
-    except Exception:
-        pass
-    try:
-        if getattr(sys, "frozen", False):
-            base = os.path.dirname(sys.executable)
-        else:
-            base = os.path.dirname(os.path.abspath(__file__))
-        path = os.path.join(base, "update.log")
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
-    except Exception:
-        pass
 
 
 # ========== 资源路径兼容 ==========
@@ -137,80 +104,10 @@ def lower_own_priority():
 
 
 # ============================================================
-# 自动更新
-# ============================================================
-def check_and_download(on_done):
-    """后台检查 version.json 并下载新 exe，完成后回调 on_done(新 exe 路径或 None)。"""
-    def worker():
-        new_exe = None
-        try:
-            log(f"[更新] 检查更新: {VERSION_URL}")
-            req = urllib.request.Request(
-                VERSION_URL,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-            )
-            with urllib.request.urlopen(req, timeout=10) as r:
-                raw = r.read().decode("utf-8")
-            meta = json.loads(raw)
-            remote_ver = str(meta.get("version", "")).strip()
-            dl_url = str(meta.get("url", "")).strip()
-            log(f"[更新] 本地={APP_VERSION} 远程={remote_ver} url={dl_url}")
-            if not dl_url:
-                log("[更新] version.json 里 url 为空，跳过下载")
-            elif remote_ver and remote_ver != APP_VERSION:
-                tmp = os.path.join(tempfile.gettempdir(),
-                                   f"app_update_{remote_ver}.exe")
-                log(f"[更新] 开始下载到 {tmp}")
-                urllib.request.urlretrieve(dl_url, tmp)
-                if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
-                    new_exe = tmp
-                    log(f"[更新] 下载完成，大小={os.path.getsize(tmp)} 字节")
-                else:
-                    log("[更新] 下载文件异常（不存在或为 0 字节）")
-        except Exception as e:
-            log(f"[更新] 检查失败（不影响使用）: {e}")
-        on_done(new_exe)
-
-    threading.Thread(target=worker, daemon=True).start()
-
-
-def apply_update_and_restart(new_exe_path):
-    """写 bat → 后台替换 exe → 重启 → 当前进程退出。"""
-    current_exe = os.path.abspath(
-        sys.executable if getattr(sys, "frozen", False) else sys.argv[0]
-    )
-    new_exe_path = os.path.abspath(new_exe_path)
-    bat_path = os.path.join(tempfile.gettempdir(), "app_update_run.bat")
-
-    bat = (
-        "@echo off\r\n"
-        "timeout /t 4 /nobreak >nul\r\n"
-        f'copy /y "{new_exe_path}" "{current_exe}"\r\n'
-        "timeout /t 2 /nobreak >nul\r\n"
-        f'start "" "{current_exe}"\r\n'
-        'del "%~f0"\r\n'
-    )
-    try:
-        with open(bat_path, "w", encoding="gbk") as f:
-            f.write(bat)
-        log(f"[更新] 已写更新脚本: {bat_path}")
-        log(f"[更新] 目标文件: {current_exe}")
-        subprocess.Popen(
-            ["cmd", "/c", bat_path],
-            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
-            close_fds=True,
-        )
-    except Exception as e:
-        log(f"[更新] 启动更新脚本失败: {e}")
-        return
-    os._exit(0)
-
-
-# ============================================================
 # 游戏窗口绑定 + 逻辑坐标换算
 # ============================================================
 class GameWindow:
-    """绑定 QRSL.exe 窗口客户区，提供逻辑坐标(1920x1080) ↔ 屏幕坐标换算。"""
+    """绑定 QRSL.exe 窗口，提供逻辑坐标(1920x1080) ↔ 屏幕坐标换算，只抓客户区截图。"""
 
     def __init__(self):
         self.hwnd = None
@@ -231,52 +128,49 @@ class GameWindow:
                   f"scale=({self.scale_x:.4f},{self.scale_y:.4f}), "
                   f"宽高比={ratio:.3f}")
             if abs(ratio - 16 / 9) > 0.02:
-                print("⚠️ 宽高比不是 16:9，模板匹配会失真，建议改成 16:9 分辨率")
-            try:
-                c = pixel_logical(22, 63)
-                print(f"[诊断] 逻辑(22,63) 当前像素={c}（主页蓝=(62,166,237)）")
-            except Exception as e:
-                print(f"[诊断] 读像素失败: {e}")
-        else:
-            print(f"⚠️ 窗口绑定失败（refresh 返回 False），hwnd={hwnd}")
+                print("⚠️ 客户区宽高比不是 16:9，模板匹配会失真，建议改成 16:9 分辨率")
         return ok
 
     def refresh(self):
+        """刷新客户区位置/尺寸（窗口可能被移动/缩放）。
+        使用 GetClientRect + ClientToScreen，排除标题栏和边框，
+        避免逻辑坐标落在标题栏上导致主页检测失败。"""
         if not self.hwnd:
             return False
         try:
-            client_rect = win32gui.GetClientRect(self.hwnd)
-            client_w = client_rect[2]
-            client_h = client_rect[3]
-            if client_w <= 0 or client_h <= 0:
+            _, _, cw, ch = win32gui.GetClientRect(self.hwnd)
+            if cw <= 0 or ch <= 0:
                 return False
-            pt = win32gui.ClientToScreen(self.hwnd, (0, 0))
-            self.left = pt[0]
-            self.top = pt[1]
-            self.width = client_w
-            self.height = client_h
-            self.scale_x = client_w / LOGICAL_WIDTH
-            self.scale_y = client_h / LOGICAL_HEIGHT
+            sx, sy = win32gui.ClientToScreen(self.hwnd, (0, 0))
+            self.left = sx
+            self.top = sy
+            self.width = cw
+            self.height = ch
+            self.scale_x = cw / LOGICAL_WIDTH
+            self.scale_y = ch / LOGICAL_HEIGHT
             return True
-        except Exception as e:
-            print(f"refresh 失败: {e}")
+        except Exception:
             return False
 
     def to_screen(self, x, y):
+        """逻辑坐标 → 屏幕坐标"""
         return int(self.left + x * self.scale_x), int(self.top + y * self.scale_y)
 
     def to_logical(self, sx, sy):
+        """屏幕坐标 → 逻辑坐标"""
         if self.scale_x <= 0 or self.scale_y <= 0:
             return sx, sy
         return int((sx - self.left) / self.scale_x), int((sy - self.top) / self.scale_y)
 
     def grab_pil(self):
+        """只抓客户区（纯游戏画面，不含标题栏/边框）。"""
         self.refresh()
         return ImageGrab.grab(bbox=(self.left, self.top,
                                     self.left + self.width,
                                     self.top + self.height))
 
     def grab_gray_logical(self):
+        """客户区截图 → 灰度 → resize 回 1920x1080（逻辑分辨率）。"""
         img = self.grab_pil()
         gray = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2GRAY)
         if gray.shape[1] != LOGICAL_WIDTH or gray.shape[0] != LOGICAL_HEIGHT:
@@ -288,7 +182,7 @@ class GameWindow:
 game_window = GameWindow()
 
 
-# ========== 逻辑坐标辅助 ==========
+# ========== 逻辑坐标辅助函数 ==========
 def click_logical(x, y):
     sx, sy = game_window.to_screen(x, y)
     pyautogui.click(sx, sy)
@@ -388,6 +282,9 @@ def load_image_template(image_path):
 
 
 def find_image_and_click(image_path, stop_event, timeout=10, confidence=0.75):
+    """窗口内灰度 3 档匹配，找到即点击逻辑坐标中心。
+    返回 True=成功；False=超时/模板缺失/被停止。
+    """
     if not os.path.exists(image_path):
         print(f"图片不存在: {image_path}")
         return False
@@ -408,11 +305,11 @@ def find_image_and_click(image_path, stop_event, timeout=10, confidence=0.75):
         if stop_event.is_set():
             return False
         try:
-            gray = game_window.grab_gray_logical()
-            gh, gw_ = gray.shape
+            gray = game_window.grab_gray_logical()   # 1920x1080 逻辑灰度
+            gh, gw = gray.shape
             best = None
             for t, w2, h2 in scaled:
-                if h2 >= gh or w2 >= gw_:
+                if h2 >= gh or w2 >= gw:
                     continue
                 res = cv2.matchTemplate(gray, t, cv2.TM_CCOEFF_NORMED)
                 _, mx, _, ml = cv2.minMaxLoc(res)
@@ -826,6 +723,7 @@ class ChestModule:
         self.chest_search_params = {'confidence_threshold': 0.75}
         self.reward_type = "yaxia"
 
+        # --- 宝箱模板（三档缩放）---
         self._template, self._tw, self._th = load_image_template(chest_image_path)
         self._scaled_templates = []
         if self._template is not None:
@@ -836,17 +734,38 @@ class ChestModule:
                                interpolation=cv2.INTER_AREA)
                 self._scaled_templates.append((s, t, tw, th))
 
-    def search_chest_fast(self, confidence=None):
-        if confidence is None:
-            confidence = self.chest_search_params['confidence_threshold']
-        if not self._scaled_templates:
+        # --- liuyan.png 模板（仅原比例 1.0，不做缩放）---
+        liuyan_path = resource_path("liuyan.png")
+        if not os.path.exists(liuyan_path):
+            liuyan_path = resource_path("images/liuyan.png")
+        self._liuyan_templates = self._load_scaled_templates(liuyan_path, scales=(1.0,))
+
+    def _load_scaled_templates(self, image_path, scales=(0.7, 0.85, 1.0)):
+        """加载模板并按指定缩放档生成。默认三档；传 (1.0,) 即原比例。"""
+        template, tw, th = load_image_template(image_path)
+        if template is None:
+            return None
+        result = []
+        for s in scales:
+            w2 = max(1, int(tw * s))
+            h2 = max(1, int(th * s))
+            if s == 1.0:
+                t = template          # 原比例直接用原图，避免 resize 引入插值误差
+            else:
+                t = cv2.resize(template, (w2, h2), interpolation=cv2.INTER_AREA)
+            result.append((s, t, w2, h2))
+        return result
+
+    def search_template_fast(self, scaled_templates, confidence=0.75):
+        """通用模板搜索。返回 ((cx, cy), conf) 或 (None, 0.0)。坐标为逻辑坐标。"""
+        if not scaled_templates:
             return None, 0.0
         try:
             gray = game_window.grab_gray_logical()
-            gh, gw_ = gray.shape
+            gh, gw = gray.shape
             best = None
-            for s, t, tw, th in self._scaled_templates:
-                if th >= gh or tw >= gw_:
+            for s, t, tw, th in scaled_templates:
+                if th >= gh or tw >= gw:
                     continue
                 res = cv2.matchTemplate(gray, t, cv2.TM_CCOEFF_NORMED)
                 _, mx, _, ml = cv2.minMaxLoc(res)
@@ -859,6 +778,12 @@ class ChestModule:
             return None, 0.0
         except Exception:
             return None, 0.0
+
+    def search_chest_fast(self, confidence=None):
+        """窗口内全灰度 3 档匹配（逻辑分辨率）。返回 ((cx, cy), conf) 或 (None, 0.0)。"""
+        if confidence is None:
+            confidence = self.chest_search_params['confidence_threshold']
+        return self.search_template_fast(self._scaled_templates, confidence)
 
     def smooth_move_mouse(self, dx, dy, mouse_base_speed=3, smooth_factor=0.2,
                           dead_zone=5, max_single_move=200):
@@ -900,8 +825,20 @@ class ChestModule:
         return False, time.time() - start
 
     def center_lock_pickup_phase(self, stop_event):
+        """
+        拾取阶段：
+          - 并行做三件事：按住 W+右键 / 连按 F 并检测金色像素 / 低频检测 liuyan.png
+          - 5 秒内命中任一条件即收工
+          - 命中金色 → 开箱
+          - 命中 liuyan.png → 点击它 → 2s → 按 F → 2s → 复查金色 → 有则开箱，无则放弃
+          - 都没命中 → 直接放弃，回主循环（不再按 ESC）
+        """
         interrupt = threading.Event()
         gold_found = threading.Event()
+        liuyan_found = threading.Event()
+        liuyan_pos = [None]
+
+        PHASE_DURATION = 5.0
 
         def hold_w_and_right():
             try:
@@ -913,7 +850,7 @@ class ChestModule:
                 pass
             start = time.time()
             while (not interrupt.is_set() and not stop_event.is_set()
-                   and time.time() - start < 10):
+                   and time.time() - start < PHASE_DURATION):
                 time.sleep(0.1)
             try:
                 pyautogui.keyUp('w')
@@ -923,7 +860,7 @@ class ChestModule:
         def press_f_and_detect_gold():
             start = time.time()
             while (not interrupt.is_set() and not stop_event.is_set()
-                   and time.time() - start < 10):
+                   and time.time() - start < PHASE_DURATION):
                 try:
                     pyautogui.press('f')
                 except Exception:
@@ -937,32 +874,80 @@ class ChestModule:
                     pass
                 time.sleep(0.2)
 
+        def detect_liuyan():
+            start = time.time()
+            while (not interrupt.is_set() and not stop_event.is_set()
+                   and time.time() - start < PHASE_DURATION):
+                pos, conf = self.search_template_fast(self._liuyan_templates, 0.75)
+                if pos:
+                    liuyan_pos[0] = pos
+                    liuyan_found.set()
+                    interrupt.set()
+                    break
+                time.sleep(0.5)
+
         wth = threading.Thread(target=hold_w_and_right, daemon=True)
         fth = threading.Thread(target=press_f_and_detect_gold, daemon=True)
+        lth = threading.Thread(target=detect_liuyan, daemon=True)
         wth.start()
         fth.start()
-        fth.join(timeout=11)
+        lth.start()
+        fth.join(timeout=PHASE_DURATION + 1.0)
         interrupt.set()
         wth.join(timeout=1)
+        lth.join(timeout=1)
         time.sleep(0.2)
         try:
             pyautogui.keyUp('w')
         except Exception:
             pass
 
-        if stop_event.is_set() or not gold_found.is_set():
-            print("10 秒内未检测到金色，按 ESC 从头开始")
-            try:
-                pyautogui.press('esc')
-            except Exception:
-                pass
+        if stop_event.is_set():
             return False
 
-        click_logical(1665, 764)
-        time.sleep(2)
-        click_logical(1255, 575)
-        time.sleep(10)
-        return True
+        # ===== 分支 A：直接检测到金色 → 开箱 =====
+        if gold_found.is_set():
+            print("检测到金色，直接开箱")
+            click_logical(1665, 764)
+            time.sleep(2)
+            click_logical(1255, 575)
+            time.sleep(10)
+            return True
+
+        # ===== 分支 B：检测到 liuyan.png → 点击 → 2s → F → 2s → 复查金色 =====
+        if liuyan_found.is_set() and liuyan_pos[0]:
+            cx, cy = liuyan_pos[0]
+            print(f"检测到 liuyan.png，点击坐标=({cx},{cy})")
+            click_logical(cx, cy)
+            if not interruptible_sleep(stop_event, 2.0):
+                return False
+            try:
+                pyautogui.press('f')
+            except Exception:
+                pass
+            if not interruptible_sleep(stop_event, 2.0):
+                return False
+
+            retry_gold = False
+            try:
+                if pixel_logical(1840, 30) == (210, 173, 72):
+                    retry_gold = True
+            except Exception:
+                pass
+
+            if stop_event.is_set() or not retry_gold:
+                print("liuyan 后复查仍未检测到金色，放弃本次宝箱")
+                return False
+            print("liuyan 后复查检测到金色，继续开箱")
+            click_logical(1665, 764)
+            time.sleep(2)
+            click_logical(1255, 575)
+            time.sleep(10)
+            return True
+
+        # ===== 分支 C：5s 内啥也没检测到 → 放弃，回主循环 =====
+        print(f"{PHASE_DURATION:.0f} 秒内未检测到金色或 liuyan，放弃本次宝箱")
+        return False
 
     def south_sound_pickup_phase(self, stop_event):
         interrupt = threading.Event()
@@ -1106,7 +1091,7 @@ class ChestModule:
 def flow_magema(stop_event, boss_name, source_key, weapon_key, bubble_key,
                 timeout, chest_module, chest_mode_var):
     while not stop_event.is_set():
-        game_window.refresh()
+        game_window.refresh()   # 每轮刷新窗口位置/尺寸（防止窗口被移动）
         if not wait_for_main_page_with_esc(stop_event, timeout=30):
             break
         if not transport_haijiade(stop_event):
@@ -1142,7 +1127,7 @@ def flow_magema(stop_event, boss_name, source_key, weapon_key, bubble_key,
 def flow_habola(stop_event, source_key, weapon_key, timeout,
                 chest_module, chest_mode_var):
     while not stop_event.is_set():
-        game_window.refresh()
+        game_window.refresh()   # 每轮刷新窗口位置/尺寸
         if not wait_for_main_page_with_esc(stop_event, timeout=30):
             break
         if not transport_jiuyu(stop_event):
@@ -1310,7 +1295,7 @@ class Card(tk.Canvas):
 class AutomationApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("幻塔BOSS")
+        self.root.title("包菜助手")
         apply_window_icon(self.root)
         self.root.configure(bg=C_BG)
         self.root.geometry("400x480")
@@ -1338,32 +1323,13 @@ class AutomationApp:
 
         self._build_ui()
 
-        # ===== 启动后台检查更新（1.5 秒后，避免阻塞 UI 出现） =====
-        self.root.after(1500, lambda: check_and_download(self._on_update_ready))
+        # Boss → 宝箱模式 联动（宝箱模式不可手动选择）
+        self.boss_var.trace_add("write", self._on_boss_changed)
+        self._on_boss_changed()
 
         keyboard.add_hotkey('f10', lambda: self.root.after(0, self.start))
         keyboard.add_hotkey('f12', lambda: self.root.after(0, self.stop))
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-
-    def _on_update_ready(self, new_exe):
-        if not new_exe:
-            return
-        try:
-            from tkinter import messagebox
-            if self.is_running:
-                messagebox.showinfo("发现新版本",
-                                    "检测到新版本，但当前正在运行任务。\n"
-                                    "请先点击「停止」，再重启程序完成更新。")
-                return
-            if messagebox.askyesno(
-                "发现新版本",
-                f"检测到新版本（当前 {APP_VERSION}）。\n"
-                "是否立即更新并重启？\n\n"
-                "（程序会关闭并自动替换为新版本后重新启动）"
-            ):
-                apply_update_and_restart(new_exe)
-        except Exception as e:
-            log(f"[更新] 提示失败: {e}")
 
     @staticmethod
     def _pick_font():
@@ -1395,7 +1361,7 @@ class AutomationApp:
                   background=[("active", C_FILL), ("readonly", C_FILL)],
                   bordercolor=[("focus", C_ACCENT), ("!focus", C_FILL)],
                   arrowcolor=[("active", C_TEXT)],
-                  foreground=[("readonly", C_TEXT), ("disabled", C_TEXT2)])
+                  foreground=[("readonly", C_TEXT), ("disabled", C_TEXT)])
 
         style.configure("Modern.TEntry",
                         fieldbackground=C_FILL, foreground=C_TEXT,
@@ -1420,8 +1386,7 @@ class AutomationApp:
 
         tk.Label(container, text="幻塔BOSS", bg=C_BG, fg=C_TEXT,
                  font=(self.F, 20, "bold"), anchor="w").pack(fill=tk.X)
-        tk.Label(container, text=f"F10 启动   ·   F12 停止   ·   v{APP_VERSION}",
-                 bg=C_BG, fg=C_TEXT2,
+        tk.Label(container, text="F10 启动   ·   F12 停止", bg=C_BG, fg=C_TEXT2,
                  font=(self.F, 10), anchor="w").pack(fill=tk.X, pady=(2, 0))
 
         card = Card(container, width=352, height=248, radius=16, bg=C_BG)
@@ -1441,6 +1406,7 @@ class AutomationApp:
                      fg=C_TEXT2 if secondary else C_TEXT,
                      font=(self.F, 11 if not secondary else 10)).pack(side=tk.LEFT)
 
+        # ===== Boss 行 =====
         r1 = row_frame()
         label(r1, "Boss")
         self.timeout_entry = ttk.Entry(r1, textvariable=self.timeout_var,
@@ -1456,6 +1422,19 @@ class AutomationApp:
 
         sep()
 
+        # ===== 宝箱模式行（挪到这里，紧跟 Boss 行下面）=====
+        r_chest = row_frame()
+        label(r_chest, "宝箱模式")
+        # 宝箱模式不可手动选择，仅随 Boss 变化自动同步
+        self.chest_combo = ttk.Combobox(r_chest, textvariable=self.chest_mode_var,
+                                        values=["南音传送", "中心锁定"],
+                                        state="disabled", width=10, height=2,
+                                        style="Modern.TCombobox")
+        self.chest_combo.pack(side=tk.RIGHT)
+
+        sep()
+
+        # ===== 武器 / 源器1 / 源器2 =====
         for text, var in (("武器", self.weapon_key_var),
                           ("源器1", self.source_key_var),
                           ("源器2", self.bubble_key_var)):
@@ -1464,15 +1443,7 @@ class AutomationApp:
             ttk.Entry(r, textvariable=var, width=5, justify="center",
                       style="Modern.TEntry").pack(side=tk.RIGHT)
 
-        sep()
-
-        r5 = row_frame()
-        label(r5, "宝箱模式")
-        ttk.Combobox(r5, textvariable=self.chest_mode_var,
-                     values=["南音传送", "中心锁定"],
-                     state="readonly", width=10, height=2,
-                     style="Modern.TCombobox").pack(side=tk.RIGHT)
-
+        # ===== 状态栏 =====
         status_row = tk.Frame(container, bg=C_BG)
         status_row.pack(fill=tk.X, pady=(16, 0))
         self.status_dot = tk.Label(status_row, text="●", bg=C_BG, fg=C_TEXT2,
@@ -1499,6 +1470,11 @@ class AutomationApp:
             font=(self.F, 12, "bold"), outer_bg=C_BG)
         self.stop_btn.pack(side=tk.LEFT, padx=(8, 0))
         self.stop_btn.set_enabled(False)
+
+    def _on_boss_changed(self, *args):
+        """Boss 变化时同步宝箱模式：哈伯拉→中心锁定，玛格玛→南音传送。"""
+        boss = self.boss_var.get()
+        self.chest_mode_var.set("中心锁定" if boss == "哈伯拉" else "南音传送")
 
     def _set_status(self, text, color=C_TEXT2):
         self.status.config(text=text, fg=color)
